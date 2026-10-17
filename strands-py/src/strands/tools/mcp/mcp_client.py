@@ -410,6 +410,11 @@ class MCPClient(ToolProvider):
         self._background_thread_event_loop: AbstractEventLoop | None = None
         self._loaded_tools: list[MCPAgentTool] | None = None
         self._tool_provider_started = False
+        # load_tools callers may run on different threads and event loops, so they share one in-flight
+        # load through a threading lock and future rather than asyncio primitives. stop() and
+        # remove_consumer() must never take this lock: Agent finalizers can run while it is held.
+        self._load_tools_lock = threading.Lock()
+        self._in_flight_load: futures.Future[Sequence[AgentTool]] | None = None
         self.server_instructions: str | None = None
         self._consumers: set[Any] = set()
         # Keep detached cleanup tasks alive until they finish; asyncio only retains weak references.
@@ -527,7 +532,9 @@ class MCPClient(ToolProvider):
         """Load and return tools from the MCP server.
 
         This method implements the ToolProvider interface by loading tools
-        from the MCP server and caching them for reuse.
+        from the MCP server and caching them for reuse. Concurrent calls, such as from agents that
+        share this client across threads, share a single load: a call made while another is in
+        flight waits for it and returns its tools or raises its error.
 
         Args:
             **kwargs: Additional arguments for future compatibility.
@@ -537,7 +544,35 @@ class MCPClient(ToolProvider):
             ``continue_on_error`` is set; the failure is sticky within a connection lifecycle and is
             not retried on subsequent calls. Teardown (removing the last consumer, or ``stop()``)
             resets the client so a later consumer reconnects.
+
+        Raises:
+            ToolProviderException: If the client fails to start and ``continue_on_error`` is not set.
         """
+        with self._load_tools_lock:
+            in_flight_load = self._in_flight_load
+            is_loader = in_flight_load is None
+            if in_flight_load is None:
+                in_flight_load = self._in_flight_load = futures.Future()
+
+        if not is_loader:
+            logger.debug("waiting for the in-flight tool load")
+            # Blocking is safe: the loader runs synchronously on its own thread and never needs this caller's loop.
+            return in_flight_load.result()
+
+        try:
+            tools = self._start_and_list_tools()
+        except BaseException as error:
+            in_flight_load.set_exception(error)
+            raise
+        else:
+            in_flight_load.set_result(tools)
+            return tools
+        finally:
+            with self._load_tools_lock:
+                self._in_flight_load = None
+
+    def _start_and_list_tools(self) -> Sequence[AgentTool]:
+        """Start the client if needed and list its tools, returning the cached tools once loaded."""
         logger.debug(
             "started=<%s>, cached_tools=<%s> | loading tools",
             self._tool_provider_started,

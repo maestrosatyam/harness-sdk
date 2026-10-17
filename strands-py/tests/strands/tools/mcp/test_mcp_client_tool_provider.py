@@ -1,6 +1,8 @@
 """Unit tests for MCPClient ToolProvider functionality."""
 
+import asyncio
 import re
+import threading
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -10,7 +12,7 @@ from strands.tools.mcp import MCPClient
 from strands.tools.mcp.mcp_agent_tool import MCPAgentTool
 from strands.tools.mcp.mcp_client import ToolFilters
 from strands.types import PaginatedList
-from strands.types.exceptions import ToolProviderException
+from strands.types.exceptions import MCPClientInitializationError, ToolProviderException
 
 
 @pytest.fixture
@@ -55,6 +57,49 @@ def create_mock_tool(tool_name: str, mcp_tool_name: str | None = None) -> MagicM
     tool.mcp_tool.name = mcp_tool_name or tool_name
     tool.mcp_tool.description = f"Description for {tool_name}"
     return tool
+
+
+class ReleaseCountingLock:
+    """A lock that lets a test wait until a given number of callers have passed through it."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._released = threading.Condition()
+        self._release_count = 0
+
+    def __enter__(self) -> None:
+        self._lock.acquire()
+
+    def __exit__(self, *exc_info: object) -> None:
+        self._lock.release()
+        with self._released:
+            self._release_count += 1
+            self._released.notify_all()
+
+    def wait_for_releases(self, count: int) -> None:
+        with self._released:
+            self._released.wait_for(lambda: self._release_count >= count, timeout=10)
+
+
+def load_tools_from_threads(client: MCPClient, thread_count: int) -> list[object]:
+    """Call load_tools from several threads at once, each on its own event loop, and collect each result or error."""
+    barrier = threading.Barrier(thread_count)
+    outcomes: list[object] = [None] * thread_count
+
+    def load(index: int) -> None:
+        barrier.wait()
+        try:
+            outcomes[index] = asyncio.run(client.load_tools())
+        except Exception as error:
+            outcomes[index] = error
+
+    threads = [threading.Thread(target=load, args=(index,)) for index in range(thread_count)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+    assert not any(thread.is_alive() for thread in threads)
+    return outcomes
 
 
 def test_init_with_tool_filters_and_prefix(mock_transport):
@@ -505,6 +550,104 @@ def test_mcp_client_reuse_across_multiple_agents(mock_transport):
         # Final cleanup when last agent is removed
         agent_2.cleanup()
         mock_stop.assert_called_once()  # Now it should stop
+
+
+def test_load_tools_concurrent_calls_share_one_start(mock_transport, mock_agent_tool):
+    """Concurrent load_tools calls on a shared client start it and list its tools once (#4896)."""
+    thread_count = 4
+    client = MCPClient(mock_transport)
+    client._load_tools_lock = ReleaseCountingLock()
+
+    def start_once_all_callers_arrive():
+        client._load_tools_lock.wait_for_releases(thread_count)
+        return client
+
+    with (
+        patch.object(client, "start", side_effect=start_once_all_callers_arrive) as mock_start,
+        patch.object(client, "list_tools_sync", return_value=PaginatedList([mock_agent_tool])) as mock_list_tools,
+    ):
+        tru_outcomes = load_tools_from_threads(client, thread_count)
+
+    exp_outcomes = [[mock_agent_tool]] * thread_count
+    assert tru_outcomes == exp_outcomes
+    mock_start.assert_called_once()
+    mock_list_tools.assert_called_once()
+
+
+def test_load_tools_concurrent_calls_share_start_failure(mock_transport, mock_agent_tool):
+    """Calls waiting on an in-flight start receive its failure, and a later call starts afresh (#4896)."""
+    thread_count = 4
+    client = MCPClient(mock_transport)
+    client._load_tools_lock = ReleaseCountingLock()
+
+    def fail_once_all_callers_arrive():
+        client._load_tools_lock.wait_for_releases(thread_count)
+        raise MCPClientInitializationError("connection refused")
+
+    with patch.object(client, "start", side_effect=fail_once_all_callers_arrive) as mock_start:
+        tru_outcomes = load_tools_from_threads(client, thread_count)
+
+    assert all(isinstance(outcome, ToolProviderException) for outcome in tru_outcomes)
+    assert {str(outcome) for outcome in tru_outcomes} == {"Failed to start MCP client: connection refused"}
+    mock_start.assert_called_once()
+
+    with (
+        patch.object(client, "start") as mock_start,
+        patch.object(client, "list_tools_sync", return_value=PaginatedList([mock_agent_tool])),
+    ):
+        tru_tools = asyncio.run(client.load_tools())
+
+    assert tru_tools == [mock_agent_tool]
+    mock_start.assert_called_once()
+
+
+def test_load_tools_concurrent_calls_share_continue_on_error_failure(mock_transport):
+    """With continue_on_error, calls waiting on an in-flight start that fails all get no tools (#4896)."""
+    thread_count = 4
+    client = MCPClient(mock_transport, continue_on_error=True)
+    client._load_tools_lock = ReleaseCountingLock()
+
+    def fail_once_all_callers_arrive():
+        client._load_tools_lock.wait_for_releases(thread_count)
+        raise MCPClientInitializationError("connection refused")
+
+    with patch.object(client, "start", side_effect=fail_once_all_callers_arrive) as mock_start:
+        tru_outcomes = load_tools_from_threads(client, thread_count)
+
+    assert tru_outcomes == [[]] * thread_count
+    assert client.connection_failed is True
+    mock_start.assert_called_once()
+
+
+def test_stop_does_not_wait_for_in_flight_load_tools(mock_transport, mock_agent_tool):
+    """stop() does not wait on an in-flight load_tools call, so teardown from a finalizer cannot deadlock on it."""
+    client = MCPClient(mock_transport)
+    start_entered = threading.Event()
+    release_start = threading.Event()
+
+    def blocking_start():
+        start_entered.set()
+        release_start.wait(timeout=10)
+        return client
+
+    with (
+        patch.object(client, "start", side_effect=blocking_start),
+        patch.object(client, "list_tools_sync", return_value=PaginatedList([mock_agent_tool])),
+    ):
+        loader = threading.Thread(target=asyncio.run, args=(client.load_tools(),))
+        loader.start()
+        assert start_entered.wait(timeout=10)
+
+        stopper = threading.Thread(target=client.stop, args=(None, None, None))
+        stopper.start()
+        stopper.join(timeout=10)
+        tru_stop_returned = not stopper.is_alive()
+
+        release_start.set()
+        loader.join(timeout=10)
+
+    assert tru_stop_returned
+    assert not loader.is_alive()
 
 
 def test_list_tools_sync_prefix_override_constructor_default(mock_transport):
