@@ -412,6 +412,10 @@ class MCPClient(ToolProvider):
         self._tool_provider_started = False
         self.server_instructions: str | None = None
         self._consumers: set[Any] = set()
+        # Held by remove_consumer() while it tears the client down for its last consumer, so that
+        # add_consumer() can wait for the teardown to finish. remove_consumer() only ever tries it without
+        # blocking: it runs from Agent finalizers, which can fire on the thread that holds it.
+        self._consumer_teardown_lock = threading.Lock()
         # Keep detached cleanup tasks alive until they finish; asyncio only retains weak references.
         self._background_cleanup_tasks: set[asyncio.Task[Any]] = set()
         self._accept_background_cleanup_tasks = True
@@ -604,9 +608,16 @@ class MCPClient(ToolProvider):
     def add_consumer(self, consumer_id: Any, **kwargs: Any) -> None:
         """Add a consumer to this tool provider.
 
-        Synchronous to prevent GC deadlocks when called from Agent finalizers.
+        If the client is still being torn down after its previous last consumer was removed, this waits
+        for the teardown to finish, so the consumer's tools come from a new session rather than the
+        closing one.
         """
         self._consumers.add(consumer_id)
+        # A teardown that starts after the add above sees this consumer and keeps the session. One that
+        # has already committed to stopping holds the lock until stop() has cleared the consumer set, so
+        # register again once it is done. Agent finalizers only remove consumers, so this never waits in one.
+        with self._consumer_teardown_lock:
+            self._consumers.add(consumer_id)
         logger.debug("added provider consumer, count=%d", len(self._consumers))
 
     def remove_consumer(self, consumer_id: Any, **kwargs: Any) -> None:
@@ -621,18 +632,32 @@ class MCPClient(ToolProvider):
         self._consumers.discard(consumer_id)
         logger.debug("removed provider consumer, count=%d", len(self._consumers))
 
+        if not self._needs_consumer_teardown():
+            return
+        # Never block here. If the lock is taken, another remove_consumer() is already tearing the client
+        # down, or add_consumer() is registering a consumer that keeps it running.
+        if not self._consumer_teardown_lock.acquire(blocking=False):
+            return
+        try:
+            # A consumer may have been added since the check above.
+            if not self._needs_consumer_teardown():
+                return
+            logger.debug("no consumers remaining, cleaning up")
+            self.stop(None, None, None)  # Existing sync method - safe for finalizers
+            self._tool_provider_started = False
+            self._loaded_tools = None
+        except Exception as error:
+            logger.error("error=<%s> | failed to cleanup MCP client", error)
+            raise ToolProviderException(f"Failed to cleanup MCP client: {error}") from error
+        finally:
+            self._consumer_teardown_lock.release()
+
+    def _needs_consumer_teardown(self) -> bool:
+        """Whether no consumers remain and the client has a session, or a failed attempt, to reset."""
         # A swallowed continue_on_error failure leaves _tool_provider_started False but still needs
         # teardown so the sticky _connection_failed flag resets and the client can reconnect for a
         # later consumer, matching the reset-on-zero-consumers behavior of a successful client.
-        if not self._consumers and (self._tool_provider_started or self._connection_failed):
-            logger.debug("no consumers remaining, cleaning up")
-            try:
-                self.stop(None, None, None)  # Existing sync method - safe for finalizers
-                self._tool_provider_started = False
-                self._loaded_tools = None
-            except Exception as e:
-                logger.error("error=<%s> | failed to cleanup MCP client", e)
-                raise ToolProviderException(f"Failed to cleanup MCP client: {e}") from e
+        return not self._consumers and (self._tool_provider_started or self._connection_failed)
 
     # MCP-specific methods
 

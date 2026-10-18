@@ -1,6 +1,8 @@
 """Unit tests for MCPClient ToolProvider functionality."""
 
+import asyncio
 import re
+import threading
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -467,6 +469,187 @@ async def test_load_tools_reconnects_for_new_consumer_after_continue_on_error_fa
         assert len(tools) == 1
         assert tools[0].tool_name == "recovered_tool"
         assert mock_start.call_count == 2
+
+
+class FakeSessions:
+    """Fakes start() and the tool listing of a client, numbering the sessions it starts.
+
+    Each session serves one tool named after its number. Its background thread is a stand-in whose join()
+    calls `on_join`, so a test can pause stop() while it tears a session down.
+    """
+
+    def __init__(self, client: MCPClient) -> None:
+        self.client = client
+        self.started = 0
+        self.on_join = lambda: None
+
+    def start(self) -> MCPClient:
+        self.started += 1
+        background_thread = MagicMock()
+        background_thread.join.side_effect = lambda *args, **kwargs: self.on_join()
+        self.client._background_thread = background_thread
+        return self.client
+
+    def list_tools(self, *args: object, **kwargs: object) -> PaginatedList[MCPAgentTool]:
+        return PaginatedList([create_mock_tool(f"session_{self.started}_tool")])
+
+
+@pytest.fixture
+def fake_sessions(mock_transport):
+    sessions = FakeSessions(MCPClient(mock_transport))
+    with (
+        patch.object(sessions.client, "start", side_effect=sessions.start),
+        patch.object(sessions.client, "list_tools_sync", side_effect=sessions.list_tools),
+    ):
+        sessions.client.add_consumer("agent_a")
+        asyncio.run(sessions.client.load_tools())
+        yield sessions
+
+
+class TeardownLock:
+    """Stands in for the client's teardown lock and calls `on_acquire(blocking)` before each acquire."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.on_acquire = lambda blocking: None
+
+    def acquire(self, blocking: bool = True, timeout: float = -1) -> bool:
+        self.on_acquire(blocking)
+        return self._lock.acquire(blocking, timeout)
+
+    def release(self) -> None:
+        self._lock.release()
+
+    def __enter__(self) -> None:
+        self.acquire()
+
+    def __exit__(self, *exc_info: object) -> None:
+        self.release()
+
+
+def attach_while_teardown_is_paused(
+    client: MCPClient, teardown_paused: threading.Event, resume_teardown: threading.Event
+) -> list[str]:
+    """Remove the last consumer on one thread and attach another on a second thread while the teardown is paused.
+
+    The teardown resumes once the new consumer is waiting for it or has loaded its tools. Returns the names of
+    the tools the new consumer loaded.
+    """
+
+    def resume_once_waiting(blocking: bool) -> None:
+        if blocking:
+            resume_teardown.set()
+
+    teardown_lock = TeardownLock()
+    teardown_lock.on_acquire = resume_once_waiting
+    client._consumer_teardown_lock = teardown_lock  # type: ignore[assignment]
+    loaded_tool_names: list[str] = []
+
+    def attach() -> None:
+        client.add_consumer("agent_b")
+        loaded_tool_names.extend(tool.tool_name for tool in asyncio.run(client.load_tools()))
+        resume_teardown.set()
+
+    teardown = threading.Thread(target=client.remove_consumer, args=("agent_a",))
+    teardown.start()
+    assert teardown_paused.wait(timeout=10)
+    attacher = threading.Thread(target=attach)
+    attacher.start()
+    teardown.join(timeout=10)
+    attacher.join(timeout=10)
+    assert not teardown.is_alive() and not attacher.is_alive()
+    return loaded_tool_names
+
+
+def test_consumer_attached_while_the_session_closes_gets_a_new_session(fake_sessions: FakeSessions) -> None:
+    """A consumer that attaches while the last consumer's teardown is closing the session gets tools from a new
+    session and stays registered, instead of getting the closing session's tools and being dropped by stop()."""
+    client = fake_sessions.client
+    teardown_paused = threading.Event()
+    resume_teardown = threading.Event()
+
+    def pause_while_closing() -> None:
+        teardown_paused.set()
+        resume_teardown.wait(timeout=10)
+
+    fake_sessions.on_join = pause_while_closing
+
+    tru_tool_names = attach_while_teardown_is_paused(client, teardown_paused, resume_teardown)
+
+    assert tru_tool_names == ["session_2_tool"]
+    assert client._consumers == {"agent_b"}
+    assert client._tool_provider_started is True
+    assert fake_sessions.started == 2
+
+
+def test_teardown_does_not_reset_a_session_started_after_stop_returns(fake_sessions: FakeSessions) -> None:
+    """The last consumer's teardown does not reset the state of a session that a newly attached consumer starts
+    once stop() has returned, so a later consumer reuses that session instead of starting it again."""
+    client = fake_sessions.client
+    teardown_paused = threading.Event()
+    resume_teardown = threading.Event()
+    real_stop = client.stop
+
+    def stop_then_pause(exc_type: None, exc_val: None, exc_tb: None) -> None:
+        real_stop(exc_type, exc_val, exc_tb)
+        teardown_paused.set()
+        resume_teardown.wait(timeout=10)
+
+    with patch.object(client, "stop", side_effect=stop_then_pause):
+        tru_tool_names = attach_while_teardown_is_paused(client, teardown_paused, resume_teardown)
+
+    assert tru_tool_names == ["session_2_tool"]
+    assert client._tool_provider_started is True
+    assert [tool.tool_name for tool in client._loaded_tools or []] == ["session_2_tool"]
+
+    client.add_consumer("agent_c")
+    asyncio.run(client.load_tools())
+
+    assert fake_sessions.started == 2
+
+
+def test_remove_consumer_during_teardown_returns_without_stopping_again(fake_sessions: FakeSessions) -> None:
+    """A remove_consumer() call made while the client is being torn down, as an Agent finalizer that runs on the
+    tearing-down thread would make, returns at once instead of waiting for the teardown or repeating it."""
+    client = fake_sessions.client
+    joins: list[str] = []
+
+    def join_and_remove_again() -> None:
+        joins.append("join")
+        if len(joins) == 1:
+            client.remove_consumer("agent_a")
+
+    fake_sessions.on_join = join_and_remove_again
+    teardown = threading.Thread(target=client.remove_consumer, args=("agent_a",))
+    teardown.start()
+    teardown.join(timeout=10)
+
+    assert not teardown.is_alive()
+    assert joins == ["join"]
+
+
+def test_remove_consumer_keeps_the_session_for_a_consumer_attached_before_teardown_begins(
+    fake_sessions: FakeSessions,
+) -> None:
+    """A consumer that attaches after the last consumer is removed, but before its teardown begins, keeps the
+    session running."""
+    client = fake_sessions.client
+    joins: list[str] = []
+    fake_sessions.on_join = lambda: joins.append("join")
+
+    def attach_before_teardown_begins(blocking: bool) -> None:
+        if not blocking:
+            client.add_consumer("agent_b")
+
+    teardown_lock = TeardownLock()
+    teardown_lock.on_acquire = attach_before_teardown_begins
+    client._consumer_teardown_lock = teardown_lock  # type: ignore[assignment]
+
+    client.remove_consumer("agent_a")
+
+    assert joins == []
+    assert client._consumers == {"agent_b"}
+    assert client._tool_provider_started is True
 
 
 def test_mcp_client_reuse_across_multiple_agents(mock_transport):
