@@ -1,10 +1,16 @@
 import asyncio
 import base64
+import gc
+import math
 import threading
 import time
+import warnings
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import anyio
 import pytest
 from mcp import ListToolsResult
 from mcp.types import CallToolResult as MCPCallToolResult
@@ -1628,6 +1634,107 @@ def test_start_raises_when_the_subscription_never_acknowledges(mock_transport, m
             client.start()
 
     assert time.time() - started < 10
+
+
+def _start_on_thread(client: MCPClient, hang_up: Callable[[], None]) -> tuple[bool, Exception | None]:
+    """Run client.start() on a thread and report whether it returned within 10 seconds, and what it raised.
+
+    If start() is still blocked after 10 seconds, hang_up() closes the connection from the server side so the
+    thread can finish instead of outliving the test.
+    """
+    raised: list[Exception] = []
+
+    def start() -> None:
+        try:
+            client.start()
+        except Exception as error:
+            raised.append(error)
+
+    starter = threading.Thread(target=start, daemon=True)
+    starter.start()
+    starter.join(timeout=10)
+    returned_in_time = not starter.is_alive()
+    if not returned_in_time:
+        hang_up()
+        starter.join(timeout=10)
+    return returned_in_time, raised[0] if raised else None
+
+
+def test_start_raises_when_the_server_never_answers_the_handshake(
+    mock_transport: dict[str, Any], mock_session: AsyncMock
+) -> None:
+    """Test that a server that never answers the handshake bounds start() instead of hanging it."""
+    pending_handshakes: list[tuple[asyncio.AbstractEventLoop, asyncio.Event]] = []
+
+    async def never_answering_negotiation(session: Any) -> None:
+        answered = asyncio.Event()
+        pending_handshakes.append((asyncio.get_running_loop(), answered))
+        await answered.wait()
+        raise ConnectionError("server hung up")
+
+    def hang_up() -> None:
+        for loop, answered in pending_handshakes:
+            loop.call_soon_threadsafe(answered.set)
+
+    with patch("strands.tools.mcp.mcp_client.negotiate_session", new=never_answering_negotiation):
+        client = MCPClient(mock_transport["transport_callable"], startup_timeout=1)
+        returned_in_time, error = _start_on_thread(client, hang_up)
+
+    assert returned_in_time, "start() was still blocked 10s after its 1s startup_timeout"
+    assert isinstance(error, MCPClientInitializationError)
+    mock_transport["transport_cm"].__aexit__.assert_awaited_once()
+    assert client._background_thread is None
+
+
+def test_start_closes_the_session_when_the_server_never_answers_the_handshake() -> None:
+    """Test that a real session to a server that never answers is torn down when start() times out."""
+    connection: dict[str, Any] = {}
+    transport_closed = threading.Event()
+
+    @asynccontextmanager
+    async def unanswered_transport() -> AsyncIterator[tuple[Any, Any]]:
+        to_client_send, to_client_receive = anyio.create_memory_object_stream[Any](math.inf)
+        to_server_send, to_server_receive = anyio.create_memory_object_stream[Any](math.inf)
+        connection.update(loop=asyncio.get_running_loop(), to_client=to_client_send)
+        try:
+            yield to_client_receive, to_server_send
+        finally:
+            for stream in (to_client_send, to_client_receive, to_server_send, to_server_receive):
+                stream.close()
+            transport_closed.set()
+
+    def hang_up() -> None:
+        connection["loop"].call_soon_threadsafe(connection["to_client"].close)
+
+    client = MCPClient(unanswered_transport, startup_timeout=1)
+    returned_in_time, error = _start_on_thread(client, hang_up)
+
+    assert returned_in_time, "start() was still blocked 10s after its 1s startup_timeout"
+    assert isinstance(error, MCPClientInitializationError)
+    assert transport_closed.is_set()
+    assert client._background_thread is None
+
+
+def test_stop_after_failed_start_leaves_no_unawaited_coroutine(mock_transport: dict[str, Any]) -> None:
+    """Test that stop() signals a background loop that has already finished without leaving a coroutine unawaited."""
+    mock_transport["transport_cm"].__aenter__.side_effect = ConnectionError("server unavailable")
+    client = MCPClient(mock_transport["transport_callable"])
+    real_stop = client.stop
+
+    def stop_once_the_background_loop_has_finished(*args: Any) -> None:
+        assert client._background_thread is not None
+        client._background_thread.join(timeout=10)
+        real_stop(*args)
+
+    with warnings.catch_warnings(record=True) as caught_warnings:
+        warnings.simplefilter("always")
+        with patch.object(client, "stop", side_effect=stop_once_the_background_loop_has_finished):
+            with pytest.raises(MCPClientInitializationError):
+                client.start()
+        gc.collect()
+
+    tru_messages = [str(warning.message) for warning in caught_warnings if "never awaited" in str(warning.message)]
+    assert tru_messages == []
 
 
 def test_stop_resets_tools_refresh_state_for_restart(mock_transport, mock_session):

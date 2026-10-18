@@ -48,6 +48,7 @@ from mcp.types import (
     ListResourceTemplatesResult,
     PaginatedRequestParams,
     ReadResourceResult,
+    ServerCapabilities,
     TextResourceContents,
 )
 from mcp.types import CallToolResult as MCPCallToolResult
@@ -681,13 +682,15 @@ class MCPClient(ToolProvider):
             # Signal close future if event loop exists
             if self._background_thread_event_loop is not None:
 
-                async def _set_close_event() -> None:
+                def _set_close_event() -> None:
                     if self._close_future and not self._close_future.done():
                         self._close_future.set_result(None)
 
                 # Not calling _invoke_on_background_thread since the session does not need to exist
-                # we only need the thread and event loop to exist.
-                asyncio.run_coroutine_threadsafe(coro=_set_close_event(), loop=self._background_thread_event_loop)
+                # we only need the thread and event loop to exist. A plain callback, not a coroutine:
+                # after a failed start the loop may already have finished and never run it, and an
+                # unrun coroutine is reported as never awaited.
+                self._background_thread_event_loop.call_soon_threadsafe(_set_close_event)
 
             self._log_debug_with_thread("waiting for background thread to join")
             self._background_thread.join()
@@ -1496,7 +1499,7 @@ class MCPClient(ToolProvider):
                     **task_session_kwargs(self._is_tasks_enabled()),
                 ) as session:
                     self._log_debug_with_thread("initializing MCP session")
-                    instructions, caps = await negotiate_session(session)
+                    instructions, caps = await self._negotiate_within_startup_timeout(session)
 
                     self._log_debug_with_thread("session initialized successfully")
                     # Store server instructions from the handshake for Host applications
@@ -1566,6 +1569,21 @@ class MCPClient(ToolProvider):
                         pending,
                         timeout=max(0, deadline - asyncio.get_event_loop().time()),
                     )
+
+    async def _negotiate_within_startup_timeout(
+        self, session: ClientSession
+    ) -> tuple[str | None, ServerCapabilities | None]:
+        """Negotiate the session, giving up after the startup timeout.
+
+        When start() times out it calls stop(), which joins the background thread and cannot interrupt a
+        pending handshake, so a server that never answers would otherwise block start() forever.
+        """
+        try:
+            return await asyncio.wait_for(negotiate_session(session), timeout=self._startup_timeout)
+        except asyncio.TimeoutError as timeout_error:
+            raise MCPClientInitializationError(
+                "timed out waiting for the server to answer the initialization handshake"
+            ) from timeout_error
 
     # Raise an exception if the underlying client raises an exception in a message
     # This happens when the underlying client has an http timeout error
