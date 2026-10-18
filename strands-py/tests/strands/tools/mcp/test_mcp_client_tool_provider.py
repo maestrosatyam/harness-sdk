@@ -507,17 +507,20 @@ def fake_sessions(mock_transport):
 
 
 class TeardownLock:
-    """Stands in for the client's teardown lock and calls `on_acquire(blocking)` before each acquire."""
+    """Stands in for the client's teardown lock and calls `on_acquire(blocking)` before each acquire and
+    `on_release()` before each release."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self.on_acquire = lambda blocking: None
+        self.on_release = lambda: None
 
     def acquire(self, blocking: bool = True, timeout: float = -1) -> bool:
         self.on_acquire(blocking)
         return self._lock.acquire(blocking, timeout)
 
     def release(self) -> None:
+        self.on_release()
         self._lock.release()
 
     def __enter__(self) -> None:
@@ -650,6 +653,38 @@ def test_remove_consumer_keeps_the_session_for_a_consumer_attached_before_teardo
     assert joins == []
     assert client._consumers == {"agent_b"}
     assert client._tool_provider_started is True
+
+
+def test_remove_consumer_tears_down_when_the_consumer_that_kept_the_session_leaves_during_the_check(
+    fake_sessions: FakeSessions,
+) -> None:
+    """A teardown that keeps the session for a consumer that attached in the meantime still tears it down if that
+    consumer is removed before the lock is released, since that removal found the lock taken and returned."""
+    client = fake_sessions.client
+    joins: list[str] = []
+    fake_sessions.on_join = lambda: joins.append("join")
+    releases: list[str] = []
+
+    def attach_before_teardown_begins(blocking: bool) -> None:
+        if not blocking and "agent_b" not in client._consumers and not releases:
+            client.add_consumer("agent_b")
+
+    def remove_before_the_lock_is_released() -> None:
+        releases.append("release")
+        # The first release ends agent_b's add_consumer(); the second ends the check that kept the session.
+        if len(releases) == 2:
+            client.remove_consumer("agent_b")
+
+    teardown_lock = TeardownLock()
+    teardown_lock.on_acquire = attach_before_teardown_begins
+    teardown_lock.on_release = remove_before_the_lock_is_released
+    client._consumer_teardown_lock = teardown_lock  # type: ignore[assignment]
+
+    client.remove_consumer("agent_a")
+
+    assert joins == ["join"]
+    assert client._consumers == set()
+    assert client._tool_provider_started is False
 
 
 def test_mcp_client_reuse_across_multiple_agents(mock_transport):

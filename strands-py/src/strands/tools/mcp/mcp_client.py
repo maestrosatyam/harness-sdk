@@ -632,25 +632,26 @@ class MCPClient(ToolProvider):
         self._consumers.discard(consumer_id)
         logger.debug("removed provider consumer, count=%d", len(self._consumers))
 
-        if not self._needs_consumer_teardown():
-            return
-        # Never block here. If the lock is taken, another remove_consumer() is already tearing the client
-        # down, or add_consumer() is registering a consumer that keeps it running.
-        if not self._consumer_teardown_lock.acquire(blocking=False):
-            return
-        try:
-            # A consumer may have been added since the check above.
-            if not self._needs_consumer_teardown():
+        while self._needs_consumer_teardown():
+            # Never block here. If the lock is taken, another remove_consumer() is tearing the client down or
+            # will check again once it lets go, or add_consumer() is registering a consumer that keeps it running.
+            if not self._consumer_teardown_lock.acquire(blocking=False):
                 return
-            logger.debug("no consumers remaining, cleaning up")
-            self.stop(None, None, None)  # Existing sync method - safe for finalizers
-            self._tool_provider_started = False
-            self._loaded_tools = None
-        except Exception as error:
-            logger.error("error=<%s> | failed to cleanup MCP client", error)
-            raise ToolProviderException(f"Failed to cleanup MCP client: {error}") from error
-        finally:
-            self._consumer_teardown_lock.release()
+            try:
+                # A consumer may have been added since the check above.
+                if self._needs_consumer_teardown():
+                    logger.debug("no consumers remaining, cleaning up")
+                    self.stop(None, None, None)  # Existing sync method - safe for finalizers
+                    self._tool_provider_started = False
+                    self._loaded_tools = None
+                    return
+            except Exception as error:
+                logger.error("error=<%s> | failed to cleanup MCP client", error)
+                raise ToolProviderException(f"Failed to cleanup MCP client: {error}") from error
+            finally:
+                self._consumer_teardown_lock.release()
+            # The consumer that kept the session may have been removed while the lock was held, by a call
+            # that found the lock taken and returned, so check again.
 
     def _needs_consumer_teardown(self) -> bool:
         """Whether no consumers remain and the client has a session, or a failed attempt, to reset."""
